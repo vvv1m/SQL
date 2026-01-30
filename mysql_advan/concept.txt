@@ -433,6 +433,300 @@ SQL优化
     注意 当语句一次修改多条表中数据，触发器会触发多次，跟行数相关
 
 
+锁  --- 计算机协调多个进程或线程并发访问某一资源的机制。数据库中，除传统的计算资源（CPU、RAM、IO）的争用外，数据也是一种供许多用户共享的资源。如何保证数据并发访问的
+        一致性、有效性是所有数据库必须解决的一个问题，锁冲突也是影响数据库并发访问性能的一个重要因素。从这个角度来说，锁对数据库而言显得尤其重要，也更加复杂
+    分类
+        mysql中，按照锁的粒度分
+            1 全局锁 --- 锁定数据库中的所有表
+            2 表级锁 --- 每次操作锁住整张表
+            3 行级锁 --- 每次操作锁住对应的行数据
+    全局锁 --- 对整个数据库实例加锁，加锁后整个实例处于只读状态，后续的DML的写语句，DDL语句以及更新操作的事务提交语句都将被阻塞
+            经典使用场景是做全库的逻辑备份，对所有表进行锁定，从而获取一致性视图，保证数据完整
+        演示
+            --加全局锁
+            flush tables with read lock;
+            --执行备份，利用mysqldump
+            mysqldump -u用户名 -p密码 数据库名->存入的文件名
+            --解锁
+            unlock tables;
+        特点
+            存在问题
+                1 如果在主库上备份，那么在备份期间都不能执行更新，业务基本上就得停摆
+                2 如果在从库上备份，那么在备份期间从库不能执行主库同步过来的二进制日志，会导致主从延迟
+                在InnoDB中，我们可以在备份时加上参数 --single—transaction参数来完成不加锁的一致性数据备份
+                mysqldump --single_transaction -u用户名 -p密码 数据库名->文件名.sql --底层通过快照读实现
+    表级锁 --- 每次操作锁住整张表，锁定粒度大，发生锁冲突的概率最高，并发度最低。应用在MYISAM、InnoDB、BDB等存储引擎中
+        分类
+            主要分为三类
+                1 表锁
+                2 元数据锁（meta data lock MDL）
+                3 意向锁
+        表锁
+            分类
+                1 表共享读锁（read lock）其他客户端可以读但不能写，当前客户端可以读但不能写
+                2 表独占写锁（write lock）其他客户端不能读也不能写，当前客户端可以读也可以写
+            语法
+                --加锁
+                lock tbales 表名... read/write
+                --释放锁
+                unlock tables / 客户端断开连接
+        元数据锁 --- MDL加锁过程是系统自动控制，无需显式使用，在访问一张表的时候会自动加上。MDL锁的主要作用是维护表元数据的数据一致性，在表上有活动事务的时候，不可以对
+                    元数据进行写入操作。这类语句为了避免DML与DDL冲突，保证读写的正确性
+                    在mysql5.5的时候引入MDL，当对一张表进行增删改查的时候，加MDL读锁（共享）；当对表结构进行变更操作的时候，增加MDL写锁（排他）
+            对各类语句施加方式
+                lock tables xxx read/write --- shared_read_only/shared_no_read_write
+                select、select ... lock in share mode --- shared_read --- 与shared_read、shared_write兼容，与exclusive互斥
+                insert、update、delete、select...for update --- shared_write --- 与shared_read、shared_write兼容，与exclusive互斥
+                alter table --- exclusive --- 与其他的MDL都互斥
+            查看元数据锁
+                select object_type,object_schema,object_name,lock_type,lock_duration from performance_schema.metadata_locks;
+        意向锁 --- 在mysql中，如果一个表中已经存在了行锁，再对这个表添加表锁的时候就需要检查每一行，是否有行锁，以及行锁和表锁能否兼容。这样的检查性能极低
+                那么为了避免DML在执行的时候，加的行锁与表锁的冲突，在InnoDB中引入了意向锁，使得表锁不用检查每行数据是否加锁，使用意向锁来减少表锁的检查
+                增加意向锁后，线程A在对表加行锁后也会为表添加一个意向锁，其他线程在对表加锁的时候就会检查要添加的锁与意向锁是否兼容，如果兼容就直接添加，不兼容则阻塞
+                阻塞持续到线程A的事务提交
+            分类
+                1 意向共享锁（IS） --- 由语句select ... lock in share mode 添加
+                                  ---与表锁共享锁（read）兼容，与表锁排它锁（write）互斥
+                2 意向排它锁（IX） --- 由insert、update、delete、select ... for update 添加
+                                  ---与表锁共享锁及排它锁都互斥，意向锁之间不会互斥
+            查看意向锁
+                select object_schema,object_name,index_name,lock_type,lock_mode,lock_data from performance_schema.data_locks;
+    行级锁 --- 每次操作锁住对应的行数据，锁定粒度最小，发生锁冲突的概率最低，并发度最高，应用在InnoDB引擎中
+            InnoDB的数据是基于索引组织的，行锁是通过对索引上的索引项加锁实现的，而不是对记录加的锁。
+        分类
+            1 行锁（record lock） --- 锁定单行记录的锁，防止其他事务对此行进行update和delete，在RC（read committed）、RR（repeatable read）隔离级别下都支持
+            2 间隙锁（gap lock） --- 锁定索引记录间隔（不含该记录），确保索引记录间隔不变，防止其他事务在这个间隔进行insert，产生幻读。在RR隔离级别下都支持
+            3 临键锁（next—key lock） --- 行锁和间隙锁组合，同时锁住数据，并锁住数据前面的间隙gap。在RR隔离级别下支持
+        行锁
+            InnoDB实现两种行锁
+                1 共享锁（S） --- 允许一个事务去读一行，阻止其他事务获得相同数据集的排它锁
+                2 排他锁（X） --- 允许获取排他锁的事务更新数据，阻止其他事务获取相同数据集的共享锁和排他锁
+            常见操作加锁情况
+                insert --- 排他锁 --- 自动加锁
+                update --- 排他锁 --- 自动加锁
+                delete --- 排他锁 --- 自动加锁
+                select（正常） --- 不加任何锁
+                select...lock in share mode --- 共享锁 --- 需要在select后手动加对应语句
+                select...for update --- 排他锁 --- 需要在select后手动加对应语句
+                需要注意的是，select...lock in share mode在某个版本后被标记为不推荐，可以采用等效的完全替代select...for share
+            行锁演示 --- 默认情况下，InnoDB在RR隔离级别下运行，使用next-key lock进行搜索和索引扫描，以防止幻读
+                    1 针对唯一索引进行检索时，对已存在的记录进行等值匹配的时候，将会自动优化为行锁
+                    2 InnoDB的行锁是针对于索引加的锁，不通过索引条件检索数据，那么InnoDB将对于表中的所有记录加锁，此时升级为表锁
+            查看行锁
+                select object_schema,object_name,index_name,lock_type,lock_mode,lock_data from performance_schema.data_locks;
+        间隙锁/临键锁
+            默认情况下，InnoDB在RR隔离级别下运行，InnoDB使用next-key lock进行搜索和索引扫描，以防止幻读
+                1 索引上的等值查询（唯一索引），给不存在的记录加锁时，优化为间隙锁
+                2 索引上的等值查询（普通索引），向右遍历最后一个值不满足查询需求时，next-key lock退化为间隙锁
+                    例如3,7,8对3查询，会对3之前的间隙，3本身，以及3和7之间的间隙加锁
+                3 索引上的范围查询（唯一索引），会访问到不满足条件的第一个值为止
+                    例如查询大于19，符合条件的有19和25，会锁住19这一行，接着加临键锁锁25及19-25的间隙，还加一个临建锁锁住25-正无穷的间隙以及正无穷大
+                注 --- 间隙锁的唯一目的是防止其他事物插入间隙，间隙锁可以共存，一个事务采用的间隙锁不会防止其他事物在同一间隙上施加间隙锁
+            查询间隙锁/临键锁
+                select object_schema,object_name,index_name,lock_type,lock_mode,lock_data from performance_schema.data_locks;
+
+InnoDB引擎
+    逻辑存储结构
+        Tablespace 表空间 --- 即ibd文件，一个mysql实例可以存储多个表空间，用于存储记录，索引等数据
+        Segment 段 --- 分为数据段（Leaf node segment）、索引段（Non-leaf node segment）、回滚段（Rollback segment），InnoDB是索引组织表，数据段就是B+Tree的叶子
+                    结点，索引段为B+Tree的非叶子结点。段用来管理多个Extent（区）
+        Extent 区 --- 表空间单元结构，一般1MB，默认情况下，InnoDB页大小为16K，所以一个区里有64个连续的页
+        Page 页 --- InnoDB存储引擎磁盘管理的最小单元，每个页默认大小为16K。为了保证页的连续，InnoDB每次从磁盘申请4-5个区
+        Row 行 --- InnoDB存储数据是按行存放的
+    架构
+        内存架构
+            Buffer Pool 缓冲池 --- 是主内存的中的一个区域，里面可以缓存磁盘上经常操作的真实数据，在执行增删改操作的时候，先操作缓冲池中的数据（若没有则从磁盘加载
+                                并缓存），然后再以一定频率刷新到磁盘，从而减少磁盘IO，加快处理速度
+                缓冲池以页为单位，底层采用链表数据结构管理页。根据状态将Page分为三种类型
+                    free page --- 空闲页，未被使用
+                    clean page --- 被使用页，数据未被修改过
+                    dirty page --- 脏页，被使用页，数据被修改过，页中数据与磁盘的数据产生了不一致
+            Change Buffer 更改缓冲区 --- （针对于非唯一二级索引页） 在执行DML语句的时候，如果这些数据页没有在Buffer Pool中，不会直接操作磁盘，而会将数据
+                                      变更存储在更改缓冲区中，在未来数据被读取的时候，再将数据合并到回复到Buffer Pool中，再将合并的数据刷新到磁盘中
+                意义
+                    二级索引通常非唯一，且以相对随机的顺序插入二级索引。同样，删除和更新可能会影响索引树中不相邻的二级索引页，如果每一次都操作磁盘，会造成大量的磁盘
+                    IO。有了Change Buffer，就可以在缓冲池中进行合并处理，减少磁盘IO
+            Adaptive Hash Index 自适应Hash索引 --- 用于优化对Buffer Pool的查询。InnoDB会监控对表上各索引页的查询，如果观察到Hash索引可以提升速度，则建立Hash索引
+                                                称之为 自适应。无需人工干预，系统自动完成，参数 -- adaptive_hash_index
+            Log Buffer 日志缓冲区 --- 用来保存要写入磁盘的log日志数据（redo log、undo log），默认大小16MB，日志会定期刷新到磁盘中。如果需要更新、插入或删除许多行
+                                    的事务，增加日志缓冲区的大小可以节省磁盘IO。
+                参数
+                    innodb_log_buffer_size --- 缓冲区大小
+                    innodb_flush_log_at_trx_commit --- 日志刷新到磁盘的时机
+                        1 --- 日志在每次事务提交的时候写入并刷新到磁盘
+                        0 --- 每秒写入并刷新一次
+                        2 --- 日志在每次事务提交后写入，每秒刷新到磁盘一次
+        磁盘架构
+            System Tablespace 系统表空间 --- 是Change Buffer存放的区域。如果表是在系统表空间而不是每个表文件或通用表空间中创建的，它也可能包含表和索引数据
+                                          在mysql5.x中还包含InnoDB数据字典、undolog等
+                参数 
+                    innodb_data_file_path
+            File-Per-Table Tablespaces 文件表空间 --- 每个表的文件表空间包含单个InnoDB表的数据和索引，并存储在文件系统上的单个数据文件中
+                参数
+                    innodb_file_per_table
+                        默认开启，说明我们建立的每张表都会有一个独立的表空间
+            General Tablespaces 通用表空间 --- 需要通过create tablespace语法创建，创建表时可以指定该空间
+                语法
+                    create tablespace xxxx add
+                    datafile 'file_name'
+                    engine = engine_name;
+                创建空间后，在创建表的时候就可以通过在create table ... 后加tablespace ts_name;存放在指定表空间中
+            Undo Tablespaces 撤销表空间 --- mysql实例在初始化时会自动创建两个默认的undo表空间，初始大小16MB，用于存储undo log
+                undo_001
+                undo_002
+            Temporary Tablespaces 临时表空间 --- InnoDB使用会话临时表空间和全局临时表空间。存储用户创建的临时表等数据
+                .ibt
+            Doublewrite Buffer Files 双写缓冲区 --- InnoDB引擎将数据页从Buffer Pool刷新到磁盘前，先将数据页写入双写缓冲区文件中，便于系统异常时恢复数据
+                #ib_16384_0.dblwr
+                #ib_16384_1.dblwr
+            Redo Log 重做日志 --- 用来实现事务的持久性。由两部分组成，重做日志缓冲（redo log buffer）以及重做日志文件（redo log），前者在内存中，后者在磁盘中。
+                                当事务提交后会把所有修改信息都存到该日志中，用于在刷新脏页到磁盘时，发生错误时，进行数据恢复使用。
+                循环写，每隔一段时间就清理，因为事务提交后，日志中内容就没什么用了
+                ib_logfile0
+                ib_logfile1
+                两个文件循环写入
+        后台线程 --- 将InnoDB缓冲池中的数据在合适的时机刷新到磁盘文件中
+            分类
+                1 Master Thread 核心后台线程 --- 负责调度其他线程，还负责将缓冲池中的数据异步刷新到磁盘中，保持数据的一致性，包括脏页的刷新、合并插入缓存、undo页的回收
+                2 IO Thread --- InnoDB中大量使用AIO（异步非阻塞）来处理IO请求，以极大提高数据库性能，而IO Thread主要负责这些IO请求的回调
+                    分类
+                        Read thread --- 默认个数4 --- 负责读操作
+                        Write thread --- 默认个数4 --- 负责写操作
+                        Log thread --- 默认个数1 --- 负责将日志缓冲区刷新到磁盘
+                        Insert buffer thread --- 默认个数1 --- 负责将写缓冲区内容刷新到磁盘
+                3 Purge Thread --- 主要用于回收事务已经提交了的undo log，在事务提交后，undo log可能不用了，就用它来回收
+                4 Page Cleaner Thread --- 协助Master Thread刷新脏页到磁盘的线程，它可以减轻Master Thread的工作压力，减少阻塞
+            后台线程将内存架构和磁盘架构连接起来
+    事务原理 --- 主要探讨如何保证事务的原子性、一致性、隔离性、持久性
+        对于原子性、一致性、持久性，是由InnoDB底层的两份日志保障的，即redo log和undo log
+            redo log --- 解决持久性
+                重做日志记录的是事务提交时数据页的物理修改，是用来实现事务的持久性
+                该日志文件由两部分组成：重做日志缓冲（redo log buffer）以及重做日志文件（redo log file），前者在内存，后者在磁盘。事务提交后会把所有修改信息都存到
+                                该日志文件中，用于在刷新脏页到磁盘，发生错误时，进行数据恢复使用。主要是将随机磁盘IO转换为顺序磁盘IO，兼顾安全和效率。
+                                    当存在redo log时，数据修改提交后会先将修改存放在redolog buffer中，由redolog buffer刷新到磁盘中的redo log file，走顺序磁盘IO
+                                称为WAL（Write-Ahead Logging）。当脏页写入磁盘出现问题的时候，就通过redo log file进行数据恢复，如果没有出现问题，redolog file中
+                                的内容就失去作用了，等待循环写入
+            undo log --- 解决原子性
+                回滚日志，用于记录数据被修改前的信息，作用包含两个：提供回滚和MVCC
+
+                undo log和redo log记录物理日志不同，它是逻辑日志。可以认为当delete一条记录时，undo log会记录一条对应的insert记录（反着来）。当update一条记录时，会
+                记录一条对应相反的update记录（改回去）。当读到rollback时，就可以从undo log中的逻辑记录读取到相应内容并进行回滚。
+
+                Undo log销毁 --- undo log 在事务执行时产生，事务提交时，并不会立即删除undo log，因为这些日志可能还用于MVCC。
+                Undo log存储 --- 采用段的方式进行管理和记录，存放在前面介绍的Rollback segment回滚段中，内部包含1024个undo log segment
+        对于隔离性，是由锁机制和MVCC（多版本并发控制）来实现的
+        对于一致性，是由redo log和undo log共同实现的
+    MVCC
+        基本概念介绍
+            当前读 --- 读取的是记录的最新版本，读取时还要保证其他并发事务不能修改当前记录，会对读取的记录进行加锁。对于我们日常的操作，如
+                    select...lock in share mode（共享锁），select...for update、update、insert（排他锁）都是当前读
+            快照读 --- 简单的select（不加锁）就是快照读，读取的是记录数据的可见版本，有可能是历史数据，不加锁，是非阻塞读
+                    Read Committed --- 每次select都生成一个快照读
+                    Repeatable Read --- 开启事务后的第一个select语句才是快照读的地方
+                    Serializable --- 快照读会退化成当前读
+            MVCC Multi-Version Concurrency Control，多版本并发控制 --- 指维护一个数据的多个版本，使得读写操作没有冲突，快照读为mysql实现MVCC提供一个非阻塞读
+                                                                    功能。MVCC的具体实现，还需要依赖于数据库记录中的三个隐式字段、undo log日志，readView
+                数据库记录的三个隐藏字段
+                    当建表时，除了我们自己指定的字段，InnoDB引擎还会隐式添加三个字段
+                        DB_TRX_ID --- 最近修改事务ID，记录插入这条记录或最后一次修改该记录的事务ID
+                        DB_ROLL_PTR --- 回滚指针，指向这条记录的上一个版本，用于配合undo log，指向上一个版本
+                        DB_ROW_ID --- 隐藏主键，如果表结构没有指定主键，将会生成该隐藏字段
+                undo log --- 回滚日志，在insert、update、delete的时候产生的便于数据回滚的日志
+                            insert的时候，产生的undo log日志只在回滚时需要，在事务提交后可被立即删除
+                            update或delete的时候，产生的undo log日志不仅在回滚时需要，在快照读的时候也需要，不会立即被删除
+                undo log版本链 --- 不同事务或相同事务对同一条记录进行修改，会导致该记录的undolog生成一条记录版本链表，链表的头部是最新的旧记录，链表的尾部是最早的旧记录
+
+                readView 读视图 --- 是快照读sql执行时MVCC提取数据的依据，记录并维护系统当前活跃的事务（未提交）的id
+                    包含四个核心字段
+                        m_ids --- 当前活跃的事务ID集合
+                        min_trx_id --- 最小活跃事务ID
+                        max_trx_id --- 预分配事务ID，当前最大事务ID+1（因为事务ID自增）
+                        creator_trx_id --- ReadView创建者的事务ID
+                    版本链数据访问规则 --- trx_id代表是当前事务ID
+                        1 trx_id == creator_trx_id? --- 可以访问该版本 --- 成立，说明数据是当前这个事务更改的
+                        2 trx_id < min_trx_id? --- 可以访问该版本 --- 成立，说明数据已经提交了
+                        3 trx_id > max_trx_id? --- 不可以访问该版本 --- 成立，说明该事务是在ReadView生成后才开启的
+                        4 min_trx_id <= trx_id <= max_trx_id? 如果同时trx_id不在m_ids中 --- 可以访问该版本 --- 成立说明数据已经提交
+                    不同的隔离级别，生成ReadView的时机不同
+                        RC --- 在事务中每一次执行快照读时生成ReadView
+                        RR --- 仅在事务中第一次执行快照读时生成ReadView，后续复用该ReadView，正式该复用解决了不可重复读
+
+mysql管理
+    系统数据库
+        mysql8.0版本后数据库安装完成后，自带以下四个数据库
+            information_schema
+                提供了访问数据库元数据的各种表和视图，包含数据库、表、字段类型及访问权限等
+            mysql
+                存储mysql服务器正常运行时需要的各种信息（时区、主从、用户、权限等）
+            performance_schema
+                为mysql服务器运行时状态提供了一个底层监控功能，主要用于收集数据库服务器性能参数
+            sys
+                包含一系列方便DBA和开发人员利用performance_schema性能数据库进行性能调优和诊断的视图
+    常用工具
+        mysql
+            语法
+                mysql [options] [database]
+            选项
+                -u, --user=name         指定用户名
+                -p, --password[=name]   指定密码
+                -h, --host=name         指定服务器IP或域名
+                -p, --port=port         指定连接端口
+                -e, --execute=name      执行sql语句并退出
+                注 -e选项可以在mysql客户端执行sql语句，而不用连接到mysql数据库再执行，对于一些批处理脚本，很方便
+                    例 mysql -u用户名 -p密码 数据库名 -e "sql语句"
+        mysqladmin --- 一个执行管理操作的客户端程序，可以用它来检查服务器的配置和当前状态、创建并删除数据库等
+            可以通过mysqladmin --help查看帮助文档
+            例
+                mysqladmin -uroot -p123456 create/drop'数据库名'
+        mysqlbinlog --- 由于服务器生成的二进制文件以二进制格式保存，所以如果想要检查这些文本的文本格式，就会使用到mysqlbinlog日志管理工具
+            语法
+                mysqlbinlog [options] log-files1 logfiles2...
+            选项
+                -d, --database=name                                 指定数据库名称，只列出指定的数据库相关操作
+                -o, --offset=#                                      忽略掉日志中的前n行命令
+                -r, --result-file=name                              将输出的文本格式日志输出到指定文件
+                -s, --short-form                                    显示简单格式，省略掉一些信息
+                -v                                                  将行事件（数据变更）重构为SQL语句
+                -vv                                                 将行事件（数据变更）重构为SQL语句，并输出注释信息
+
+                --start-datatime=date1 --stop-datetime=date2        指定日期间隔内的所有日志
+                --start-position=pos1 --stop-position=pos2          指定位置间隔内的所有日志
+        mysqlshow --- 客户端对象查找工具，用来很快地查找存在哪些数据库、数据库中的表、表中的索引或列
+            语法
+                mysqlshow [options] [db_name[ table_name[ column_name]]]
+            选项
+                --count 展示数据库和表的统计信息（总记录数）（数据库，表均可以不指定）
+                -i 显示指定数据库或指定表的状态信息
+        mysqldump --- 备份数据库及在不同数据库之间进行数据迁移。备份内容包括创建表，及插入表的sql语句
+            语法
+                mysqldump [options] db_name [tables]
+                mysqldump [options] --database/-B db1 [db2 db3...]
+                mysqldump [options] --all-database/-A
+            连接选项
+                -u -p -h -p与之前的相同
+            输出选项
+                --add-drop-database 在每个数据库创建语句前加上drop database语句
+                --add-drop-table 在每个表创建语句前加drop table，默认开启，不开启（--skip-add-drop-table）
+                -n， --no-create-db 不包含数据库的创建语句
+                -t， --no-create-into 不包含数据表的创建语句
+                -d --no-data 不包含数据
+                -t， --tab=name 自动生成两个文件：一个sql文件，创建表结构的语句；一个txt文件，数据文件
+        mysqlimport/source --- 客户端数据导入工具，用来导入mysqldump加-T参数后导出的文本文件
+            语法
+                mysqlimport [options] db_name textfile1 [textfile2...]
+            如果要导入sql文件，可以使用mysql中的source指令
+            语法
+                source/root/xxx.sql
+
+
+                
+
+            
+
+
+
+
+
 
 
 
